@@ -46,17 +46,20 @@ def generate_test_video(output_path: str):
 
     # Generate video segments with colored backgrounds and text
     colors = ["0x2C3E50", "0x2980B9", "0x27AE60"]
-    titles = ["Scene 1: Introduction", "Scene 2: Data Analysis", "Scene 3: Summary"]
+    titles = ["Scene 1 - Introduction", "Scene 2 - Data Analysis", "Scene 3 - Summary"]
     segment_files = []
 
     for i, (color, title, dur, wav) in enumerate(zip(colors, titles, durations, audio_files)):
         seg_file = str(tmp / f"seg{i}.mp4")
+        text_file = str(tmp / f"text{i}.txt")
+        with open(text_file, "w") as f:
+            f.write(title)
         subprocess.run([
             "ffmpeg",
             "-f", "lavfi", "-i",
             f"color=c={color}:s=1280x720:d={dur}",
             "-i", wav,
-            "-vf", f"drawtext=text='{title}':fontsize=40:fontcolor=white:x=(w-tw)/2:y=(h-th)/2",
+            "-vf", f"drawtext=textfile={text_file}:fontsize=40:fontcolor=white:x=(w-tw)/2:y=(h-th)/2",
             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
             "-shortest", seg_file, "-y"
         ], capture_output=True, check=True)
