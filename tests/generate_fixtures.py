@@ -69,7 +69,8 @@ def generate_test_video(output_path: str):
     concat_file = str(tmp / "concat.txt")
     with open(concat_file, "w") as f:
         for seg in segment_files:
-            f.write(f"file '{seg}'\n")
+            abs_seg = str(Path(seg).resolve())
+            f.write(f"file '{abs_seg}'\n")
 
     subprocess.run([
         "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_file,
