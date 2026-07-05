@@ -165,7 +165,7 @@ def generate_test_pdf(output_path: str):
     for x1, y1, x2, y2, text, fill_color in boxes:
         rect = fitz.Rect(x1, y1, x2, y2)
         page.draw_rect(rect, color=(0.3, 0.3, 0.3), fill=fill_color, width=1.5,
-                       border_radius=5)
+                       )
         lines = text.split("\n")
         for li, line in enumerate(lines):
             cy = (y1 + y2) / 2 - 6 * (len(lines) - 1) + li * 14
