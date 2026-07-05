@@ -108,6 +108,77 @@ def _create_png_bytes(width, height, r, g, b):
     return sig + ihdr + idat + iend
 
 
+def _render_flowchart(output_path: str) -> str:
+    """Render a state/flow diagram using Graphviz dot."""
+    dot_source = """
+digraph pipeline {
+    rankdir=TB;
+    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, margin="0.3,0.15"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    // States
+    idle      [label="Idle\\n(Waiting for Input)", fillcolor="#E8F4FD", color="#2980B9", penwidth=2];
+    ingest    [label="Ingesting\\n(Reading Files)", fillcolor="#FEF9E7", color="#F39C12", penwidth=2];
+
+    // Decision
+    node [shape=diamond];
+    check     [label="Has\\nAudio?", fillcolor="#FADBD8", color="#E74C3C", penwidth=2];
+
+    // Processing states
+    node [shape=box];
+    extract_a [label="Extract Audio\\n(ffmpeg)", fillcolor="#D5F5E3", color="#27AE60", penwidth=2];
+    stt       [label="Speech-to-Text\\n(Whisper)", fillcolor="#D5F5E3", color="#27AE60", penwidth=2];
+    extract_f [label="Extract Frames\\n(Scene Detection)", fillcolor="#D5F5E3", color="#27AE60", penwidth=2];
+    ocr       [label="OCR / Vision Parse\\n(Qwen3-VL)", fillcolor="#D5F5E3", color="#27AE60", penwidth=2];
+    merge     [label="Merge & Align\\n(Timestamps)", fillcolor="#EBF5FB", color="#3498DB", penwidth=2];
+    llm       [label="LLM Summarize\\n(Qwen3.6-35B)", fillcolor="#F5EEF8", color="#8E44AD", penwidth=2];
+
+    // Output states
+    node [shape=box, style="rounded,filled,bold"];
+    output_md [label="Markdown\\nOutput", fillcolor="#D4EFDF", color="#1E8449", penwidth=2];
+    output_pdf[label="PDF\\nOutput", fillcolor="#D4EFDF", color="#1E8449", penwidth=2];
+
+    // Error
+    node [shape=octagon, style="filled"];
+    error     [label="Error\\n(Retry/Skip)", fillcolor="#FDEDEC", color="#C0392B", penwidth=2];
+
+    // Transitions
+    idle      -> ingest    [label="file received"];
+    ingest    -> check     [label="parsed"];
+    check     -> extract_a [label="yes"];
+    check     -> extract_f [label="no (PDF only)"];
+    extract_a -> stt       [label="wav ready"];
+    stt       -> merge     [label="transcript ready"];
+    extract_f -> ocr       [label="frames ready"];
+    ocr       -> merge     [label="page text ready"];
+    merge     -> llm       [label="aligned data"];
+    llm       -> output_md [label="structured"];
+    llm       -> output_pdf[label="structured"];
+    output_md -> idle      [label="done", style=dashed];
+    output_pdf-> idle      [label="done", style=dashed];
+
+    // Error edges
+    extract_a -> error     [label="fail", style=dotted, color="#E74C3C"];
+    stt       -> error     [label="fail", style=dotted, color="#E74C3C"];
+    error     -> idle      [label="reset", style=dashed, color="#E74C3C"];
+}
+"""
+    dot_file = output_path.replace(".png", ".dot")
+    with open(dot_file, "w") as f:
+        f.write(dot_source)
+
+    try:
+        subprocess.run(
+            ["dot", "-Tpng", "-Gdpi=150", dot_file, "-o", output_path],
+            check=True, capture_output=True
+        )
+        Path(dot_file).unlink(missing_ok=True)
+        return output_path
+    except Exception:
+        Path(dot_file).unlink(missing_ok=True)
+        return None
+
+
 def generate_test_pdf(output_path: str):
     """Generate a 3-page PDF with images, flowchart, and titles."""
     import fitz
@@ -146,48 +217,16 @@ def generate_test_pdf(output_path: str):
     page.insert_text((90, 425), "• Monthly active users reached 1.2M milestone", fontsize=11)
     page.insert_text((90, 445), "• User growth rate accelerated in APAC region", fontsize=11)
 
-    # --- Page 2: Flowchart ---
+    # --- Page 2: State diagram rendered by Graphviz ---
     page = doc.new_page(width=612, height=792)
     page.insert_text((72, 60), "System Architecture - Data Pipeline", fontsize=20,
                      color=(0.1, 0.2, 0.4))
 
-    # Draw flowchart boxes
-    boxes = [
-        (206, 100, 406, 150, "Video Input", (0.6, 0.8, 1.0)),
-        (80, 200, 230, 250, "Audio\nExtraction", (1.0, 0.7, 0.5)),
-        (380, 200, 530, 250, "Frame\nExtraction", (1.0, 0.7, 0.5)),
-        (80, 310, 230, 360, "Speech-to-Text\n(Whisper)", (0.5, 0.9, 0.5)),
-        (380, 310, 530, 360, "Scene\nDetection", (0.5, 0.9, 0.5)),
-        (206, 420, 406, 470, "Content Merge\n& Alignment", (1.0, 0.9, 0.4)),
-        (206, 530, 406, 580, "PDF / Markdown\nOutput", (0.7, 0.6, 1.0)),
-    ]
-
-    for x1, y1, x2, y2, text, fill_color in boxes:
-        rect = fitz.Rect(x1, y1, x2, y2)
-        page.draw_rect(rect, color=(0.3, 0.3, 0.3), fill=fill_color, width=1.5,
-                       )
-        lines = text.split("\n")
-        for li, line in enumerate(lines):
-            cy = (y1 + y2) / 2 - 6 * (len(lines) - 1) + li * 14
-            cx = (x1 + x2) / 2
-            tw = len(line) * 4.5
-            page.insert_text((cx - tw, cy + 4), line, fontsize=10,
-                           color=(0.15, 0.15, 0.15))
-
-    # Draw arrows
-    arrows = [
-        ((306, 150), (155, 200)),   # Input -> Audio
-        ((306, 150), (455, 200)),   # Input -> Frame
-        ((155, 250), (155, 310)),   # Audio -> STT
-        ((455, 250), (455, 310)),   # Frame -> Scene
-        ((155, 360), (306, 420)),   # STT -> Merge
-        ((455, 360), (306, 420)),   # Scene -> Merge
-        ((306, 470), (306, 530)),   # Merge -> Output
-    ]
-
-    for (x1, y1), (x2, y2) in arrows:
-        page.draw_line((x1, y1), (x2, y2), color=(0.2, 0.2, 0.2), width=2)
-        page.draw_circle((x2, y2), 4, color=(0.2, 0.2, 0.2), fill=(0.2, 0.2, 0.2))
+    flowchart_png = _render_flowchart(str(Path(output_path).parent / "_flowchart.png"))
+    if flowchart_png:
+        img_rect = fitz.Rect(36, 80, 576, 750)
+        page.insert_image(img_rect, filename=flowchart_png)
+        Path(flowchart_png).unlink(missing_ok=True)
 
     # --- Page 3: Data table + notes ---
     page = doc.new_page(width=612, height=792)
