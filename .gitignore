@@ -4,6 +4,5 @@ __pycache__/
 dist/
 build/
 .venv/
-tests/fixtures/*.mp4
-tests/fixtures/*.pdf
+tests/fixtures/results/
 .build/
