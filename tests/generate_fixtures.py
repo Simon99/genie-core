@@ -153,13 +153,13 @@ def generate_test_pdf(output_path: str):
 
     # Draw flowchart boxes
     boxes = [
-        (206, 100, 406, 150, "Video Input", (0.85, 0.92, 1.0)),
-        (80, 200, 230, 250, "Audio\nExtraction", (1.0, 0.9, 0.85)),
-        (380, 200, 530, 250, "Frame\nExtraction", (1.0, 0.9, 0.85)),
-        (80, 310, 230, 360, "Speech-to-Text\n(Whisper)", (0.85, 1.0, 0.85)),
-        (380, 310, 530, 360, "Scene\nDetection", (0.85, 1.0, 0.85)),
-        (206, 420, 406, 470, "Content Merge\n& Alignment", (1.0, 1.0, 0.8)),
-        (206, 530, 406, 580, "PDF / Markdown\nOutput", (0.9, 0.85, 1.0)),
+        (206, 100, 406, 150, "Video Input", (0.6, 0.8, 1.0)),
+        (80, 200, 230, 250, "Audio\nExtraction", (1.0, 0.7, 0.5)),
+        (380, 200, 530, 250, "Frame\nExtraction", (1.0, 0.7, 0.5)),
+        (80, 310, 230, 360, "Speech-to-Text\n(Whisper)", (0.5, 0.9, 0.5)),
+        (380, 310, 530, 360, "Scene\nDetection", (0.5, 0.9, 0.5)),
+        (206, 420, 406, 470, "Content Merge\n& Alignment", (1.0, 0.9, 0.4)),
+        (206, 530, 406, 580, "PDF / Markdown\nOutput", (0.7, 0.6, 1.0)),
     ]
 
     for x1, y1, x2, y2, text, fill_color in boxes:
@@ -186,9 +186,8 @@ def generate_test_pdf(output_path: str):
     ]
 
     for (x1, y1), (x2, y2) in arrows:
-        page.draw_line((x1, y1), (x2, y2), color=(0.4, 0.4, 0.4), width=1.5)
-        # Simple arrowhead
-        page.draw_circle((x2, y2), 3, color=(0.4, 0.4, 0.4), fill=(0.4, 0.4, 0.4))
+        page.draw_line((x1, y1), (x2, y2), color=(0.2, 0.2, 0.2), width=2)
+        page.draw_circle((x2, y2), 4, color=(0.2, 0.2, 0.2), fill=(0.2, 0.2, 0.2))
 
     # --- Page 3: Data table + notes ---
     page = doc.new_page(width=612, height=792)
