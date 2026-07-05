@@ -6,45 +6,70 @@ from pathlib import Path
 
 def transcribe_audio(
     input_path: str,
-    language: str = "zh-Hans",
+    language: str = "zh",
+    model: str = "medium",
     output_srt: str | None = None,
 ) -> list[dict]:
-    """Transcribe audio/video to timestamped segments using macOS Speech Framework.
-
-    Calls the Swift CLI helper (genie-speech-cli) which wraps SFSpeechRecognizer.
+    """Transcribe audio/video using OpenAI Whisper (local).
 
     Returns list of {"start": float, "end": float, "text": str}.
-    If output_srt is provided, also writes an SRT file.
+    If output_srt is provided, also copies the SRT file there.
+
+    For Chinese-English mixed content, use language="zh" — Whisper handles
+    code-switching well with the Chinese language hint.
     """
     input_path = str(input_path)
 
-    audio_path = _extract_audio(input_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Whisper can read video files directly but WAV is faster
+        audio_path = _extract_audio(input_path, tmpdir)
 
-    try:
         cmd = [
-            "genie-speech-cli",
-            "--input", audio_path,
+            "whisper", audio_path,
+            "--model", model,
             "--language", language,
-            "--format", "json",
+            "--output_format", "json",
+            "--output_dir", tmpdir,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        segments = json.loads(result.stdout)
-    finally:
-        if audio_path != input_path:
-            Path(audio_path).unlink(missing_ok=True)
+        subprocess.run(cmd, capture_output=True, check=True)
 
-    if output_srt:
-        _write_srt(segments, output_srt)
+        json_file = Path(tmpdir) / (Path(audio_path).stem + ".json")
+        with open(json_file, "r", encoding="utf-8") as f:
+            result = json.load(f)
+
+        segments = []
+        for seg in result.get("segments", []):
+            segments.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"].strip(),
+            })
+
+        if output_srt:
+            srt_file = Path(tmpdir) / (Path(audio_path).stem + ".srt")
+            # Re-run with SRT output if needed
+            if not srt_file.exists():
+                cmd_srt = [
+                    "whisper", audio_path,
+                    "--model", model,
+                    "--language", language,
+                    "--output_format", "srt",
+                    "--output_dir", tmpdir,
+                ]
+                subprocess.run(cmd_srt, capture_output=True, check=True)
+
+            if srt_file.exists():
+                Path(output_srt).write_text(srt_file.read_text(encoding="utf-8"), encoding="utf-8")
 
     return segments
 
 
-def _extract_audio(input_path: str) -> str:
-    """Extract audio from video file to WAV for speech recognition."""
-    if input_path.endswith((".wav", ".m4a", ".aac")):
+def _extract_audio(input_path: str, output_dir: str) -> str:
+    """Extract audio from video file to WAV for faster processing."""
+    if input_path.endswith((".wav", ".m4a", ".aac", ".mp3", ".flac")):
         return input_path
 
-    output = tempfile.mktemp(suffix=".wav")
+    output = str(Path(output_dir) / "audio.wav")
     cmd = [
         "ffmpeg", "-i", input_path,
         "-vn", "-acodec", "pcm_s16le",
@@ -53,20 +78,3 @@ def _extract_audio(input_path: str) -> str:
     ]
     subprocess.run(cmd, capture_output=True, check=True)
     return output
-
-
-def _write_srt(segments: list[dict], output_path: str):
-    """Write segments to SRT format."""
-    with open(output_path, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(segments, 1):
-            start = _format_srt_time(seg["start"])
-            end = _format_srt_time(seg["end"])
-            f.write(f"{i}\n{start} --> {end}\n{seg['text']}\n\n")
-
-
-def _format_srt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
