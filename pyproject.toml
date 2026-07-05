@@ -1,0 +1,17 @@
+[project]
+name = "genie-core"
+version = "0.1.0"
+description = "Shared utilities for Genie: video processing, speech-to-text, PDF handling, LLM client"
+requires-python = ">=3.9"
+dependencies = [
+    "Pillow>=10.0",
+    "openai>=1.0",
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
