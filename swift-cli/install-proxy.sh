@@ -14,13 +14,16 @@ echo "Building genie-speech-cli..."
 cd "$SCRIPT_DIR"
 swift build -c release
 
-# Install binary
+# Install binary atomically (cp over a running/executed binary corrupts the
+# kernel's cached code signature -> launchd kills it with OS_REASON_CODESIGNING)
 mkdir -p "$BIN_DIR"
-cp .build/release/genie-speech-cli "$BIN_DIR/"
+cp .build/release/genie-speech-cli "$BIN_DIR/genie-speech-cli.new"
+mv -f "$BIN_DIR/genie-speech-cli.new" "$BIN_DIR/genie-speech-cli"
 echo "Installed to $BIN_DIR/genie-speech-cli"
 
 # Create LaunchAgent
 mkdir -p "$PLIST_DIR"
+mkdir -p "$HOME/Library/Logs"
 cat > "$PLIST_DIR/$PLIST_NAME.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,11 +41,14 @@ cat > "$PLIST_DIR/$PLIST_NAME.plist" << EOF
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
-    <string>/tmp/genie-speech-proxy.log</string>
+    <string>$HOME/Library/Logs/genie-speech-proxy.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/genie-speech-proxy.log</string>
+    <string>$HOME/Library/Logs/genie-speech-proxy.log</string>
 </dict>
 </plist>
 EOF

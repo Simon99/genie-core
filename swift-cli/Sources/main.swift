@@ -18,32 +18,40 @@ struct TranscribeResponse: Codable {
     let segments: [Segment]
 }
 
+enum TranscribeOutcome {
+    case success([Segment])
+    case failure(String)
+}
+
 // MARK: - Speech Recognition
 
-func transcribe(filePath: String, language: String) -> [Segment] {
+func transcribe(filePath: String, language: String) -> TranscribeOutcome {
     let semaphore = DispatchSemaphore(value: 0)
     let url = URL(fileURLWithPath: filePath)
     let locale = Locale(identifier: language)
 
     guard let recognizer = SFSpeechRecognizer(locale: locale) else {
-        fputs("Error: Speech recognizer not available for locale \(language)\n", stderr)
-        return []
+        return .failure("Speech recognizer not available for locale \(language)")
     }
 
     guard recognizer.isAvailable else {
-        fputs("Error: Speech recognizer is not available\n", stderr)
-        return []
+        return .failure("Speech recognizer is not available (locale \(language))")
     }
 
     let request = SFSpeechURLRecognitionRequest(url: url)
     request.shouldReportPartialResults = false
     request.addsPunctuation = true
+    // On-device recognition avoids the ~60s limit of server-based recognition.
+    if recognizer.supportsOnDeviceRecognition {
+        request.requiresOnDeviceRecognition = true
+    }
 
     var allSegments: [Segment] = []
+    var errorMessage: String? = nil
 
-    recognizer.recognitionTask(with: request) { result, error in
+    let task = recognizer.recognitionTask(with: request) { result, error in
         if let error = error {
-            fputs("Error: \(error.localizedDescription)\n", stderr)
+            errorMessage = error.localizedDescription
             semaphore.signal()
             return
         }
@@ -66,8 +74,16 @@ func transcribe(filePath: String, language: String) -> [Segment] {
         }
     }
 
-    semaphore.wait()
-    return mergeSegments(allSegments, maxGap: 1.0, maxDuration: 10.0)
+    if semaphore.wait(timeout: .now() + 900) == .timedOut {
+        task.cancel()
+        return .failure("Speech recognition timed out after 900 seconds")
+    }
+
+    if let message = errorMessage {
+        return .failure(message)
+    }
+
+    return .success(mergeSegments(allSegments, maxGap: 1.0, maxDuration: 10.0))
 }
 
 func mergeSegments(_ segments: [Segment], maxGap: Double, maxDuration: Double) -> [Segment] {
@@ -103,6 +119,7 @@ func mergeSegments(_ segments: [Segment], maxGap: Double, maxDuration: Double) -
 class HTTPServer {
     let port: UInt16
     var socket: Int32 = -1
+    let clientQueue = DispatchQueue(label: "com.genie.speech-proxy.clients", attributes: .concurrent)
 
     init(port: UInt16) {
         self.port = port
@@ -110,41 +127,111 @@ class HTTPServer {
 
     func start() {
         socket = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard socket >= 0 else {
+            fputs("Error: socket() failed: \(String(cString: strerror(errno)))\n", stderr)
+            exit(1)
+        }
         var yes: Int32 = 1
         setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = INADDR_ANY
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
 
-        withUnsafePointer(to: &addr) { ptr in
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
                 bind(socket, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
+        guard bindResult == 0 else {
+            fputs("Error: bind() failed on 127.0.0.1:\(port): \(String(cString: strerror(errno)))\n", stderr)
+            exit(1)
+        }
 
-        listen(socket, 5)
-        fputs("Speech proxy listening on http://localhost:\(port)\n", stderr)
+        guard listen(socket, 5) == 0 else {
+            fputs("Error: listen() failed on port \(port): \(String(cString: strerror(errno)))\n", stderr)
+            exit(1)
+        }
+        fputs("Speech proxy listening on http://127.0.0.1:\(port)\n", stderr)
 
         while true {
             let client = accept(socket, nil, nil)
             if client < 0 { continue }
-            handleClient(client)
+            clientQueue.async { [weak self] in
+                self?.handleClient(client)
+            }
         }
     }
 
-    func handleClient(_ client: Int32) {
+    /// Read a full HTTP request: headers, then body until Content-Length is satisfied.
+    func readRequest(_ client: Int32) -> Data? {
+        let headerTerminator = Data("\r\n\r\n".utf8)
+        var data = Data()
         var buffer = [UInt8](repeating: 0, count: 65536)
-        let n = read(client, &buffer, buffer.count)
-        guard n > 0 else { close(client); return }
 
-        let request = String(bytes: buffer[0..<n], encoding: .utf8) ?? ""
-        let lines = request.split(separator: "\r\n")
-        guard let firstLine = lines.first else { close(client); return }
+        // Read until the header terminator arrives (with a 1 MiB safety cap)
+        var headerRange = data.range(of: headerTerminator)
+        while headerRange == nil {
+            let n = read(client, &buffer, buffer.count)
+            if n <= 0 {
+                return data.isEmpty ? nil : data
+            }
+            data.append(contentsOf: buffer[0..<n])
+            headerRange = data.range(of: headerTerminator)
+            if headerRange == nil && data.count > 1_048_576 {
+                return data
+            }
+        }
+
+        guard let headers = headerRange else { return data }
+        let contentLength = parseContentLength(data.subdata(in: data.startIndex..<headers.lowerBound))
+        var bodyBytes = data.endIndex - headers.upperBound
+        while bodyBytes < contentLength {
+            let n = read(client, &buffer, buffer.count)
+            if n <= 0 { break }
+            data.append(contentsOf: buffer[0..<n])
+            bodyBytes += n
+        }
+        return data
+    }
+
+    func parseContentLength(_ headerData: Data) -> Int {
+        guard let headerStr = String(data: headerData, encoding: .utf8) else { return 0 }
+        for line in headerStr.split(separator: "\r\n") {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            if parts.count == 2 &&
+               parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
+                return Int(parts[1].trimmingCharacters(in: .whitespaces)) ?? 0
+            }
+        }
+        return 0
+    }
+
+    func handleClient(_ client: Int32) {
+        guard let requestData = readRequest(client) else {
+            close(client)
+            return
+        }
+
+        let headerTerminator = Data("\r\n\r\n".utf8)
+        guard let headerRange = requestData.range(of: headerTerminator) else {
+            respond(client, status: 400, body: "{\"error\":\"malformed request\"}")
+            return
+        }
+
+        let headerData = requestData.subdata(in: requestData.startIndex..<headerRange.lowerBound)
+        guard let headerStr = String(data: headerData, encoding: .utf8),
+              let firstLine = headerStr.split(separator: "\r\n").first else {
+            respond(client, status: 400, body: "{\"error\":\"malformed request\"}")
+            return
+        }
 
         let parts = firstLine.split(separator: " ")
-        guard parts.count >= 2 else { close(client); return }
+        guard parts.count >= 2 else {
+            respond(client, status: 400, body: "{\"error\":\"malformed request line\"}")
+            return
+        }
         let method = String(parts[0])
         let path = String(parts[1])
 
@@ -154,13 +241,12 @@ class HTTPServer {
         }
 
         if method == "POST" && path == "/transcribe" {
-            // Find JSON body after empty line
-            if let bodyRange = request.range(of: "\r\n\r\n") {
-                let body = String(request[bodyRange.upperBound...])
-                handleTranscribe(client, body: body)
-            } else {
+            let bodyData = requestData.subdata(in: headerRange.upperBound..<requestData.endIndex)
+            guard let body = String(data: bodyData, encoding: .utf8), !body.isEmpty else {
                 respond(client, status: 400, body: "{\"error\":\"no body\"}")
+                return
             }
+            handleTranscribe(client, body: body)
             return
         }
 
@@ -177,23 +263,37 @@ class HTTPServer {
         let lang = req.language ?? "zh-Hans"
         fputs("Transcribing: \(req.path) (lang: \(lang))\n", stderr)
 
-        let segments = transcribe(filePath: req.path, language: lang)
-        let response = TranscribeResponse(segments: segments)
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .prettyPrinted
-        if let jsonData = try? encoder.encode(response),
-           let jsonStr = String(data: jsonData, encoding: .utf8) {
-            respond(client, status: 200, body: jsonStr)
-        } else {
-            respond(client, status: 500, body: "{\"error\":\"encoding failed\"}")
+        switch transcribe(filePath: req.path, language: lang) {
+        case .failure(let message):
+            if let jsonData = try? JSONEncoder().encode(["error": message]),
+               let jsonStr = String(data: jsonData, encoding: .utf8) {
+                respond(client, status: 500, body: jsonStr)
+            } else {
+                respond(client, status: 500, body: "{\"error\":\"transcription failed\"}")
+            }
+        case .success(let segments):
+            let response = TranscribeResponse(segments: segments)
+            if let jsonData = try? JSONEncoder().encode(response),
+               let jsonStr = String(data: jsonData, encoding: .utf8) {
+                respond(client, status: 200, body: jsonStr)
+            } else {
+                respond(client, status: 500, body: "{\"error\":\"encoding failed\"}")
+            }
         }
     }
 
     func respond(_ client: Int32, status: Int, body: String) {
         let statusText = status == 200 ? "OK" : "Error"
-        let response = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
-        write(client, response, response.utf8.count)
+        let response = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+        let bytes = [UInt8](response.utf8)
+        var sent = 0
+        while sent < bytes.count {
+            let n = bytes.withUnsafeBufferPointer { buf in
+                write(client, buf.baseAddress! + sent, bytes.count - sent)
+            }
+            if n <= 0 { break }
+            sent += n
+        }
         close(client)
     }
 }
@@ -203,8 +303,16 @@ class HTTPServer {
 let args = CommandLine.arguments
 
 if args.contains("--server") {
-    let portIdx = args.firstIndex(of: "--port").map { args.index(after: $0) }
-    let port = portIdx.flatMap { UInt16(args[$0]) } ?? 5300
+    var port: UInt16 = 5300
+    if let flagIdx = args.firstIndex(of: "--port") {
+        let valueIdx = args.index(after: flagIdx)
+        if valueIdx < args.count, let parsed = UInt16(args[valueIdx]) {
+            port = parsed
+        } else {
+            fputs("Error: --port requires a numeric argument (1-65535)\n", stderr)
+            exit(1)
+        }
+    }
 
     SFSpeechRecognizer.requestAuthorization { status in
         switch status {
@@ -212,8 +320,14 @@ if args.contains("--server") {
             let server = HTTPServer(port: port)
             server.start()
         default:
-            fputs("Error: Speech recognition not authorized (status: \(status.rawValue))\n", stderr)
-            exit(1)
+            // Deliberate exit(0): the LaunchAgent plist uses KeepAlive/SuccessfulExit=false,
+            // which relaunches only on NON-zero exit. A zero exit here prevents an infinite
+            // restart + permission-prompt loop when speech recognition is not yet authorized.
+            // Re-grant by answering the system prompt or running once in a GUI session.
+            fputs("Error: Speech recognition not authorized (status: \(status.rawValue)). "
+                + "Grant permission in System Settings or run once in a GUI session, "
+                + "then: launchctl kickstart -k gui/$UID/com.genie.speech-proxy\n", stderr)
+            exit(0)
         }
     }
     RunLoop.main.run()
@@ -250,17 +364,22 @@ if args.contains("--server") {
     SFSpeechRecognizer.requestAuthorization { status in
         switch status {
         case .authorized:
-            let segments = transcribe(filePath: input, language: language)
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .prettyPrinted
-            if let data = try? encoder.encode(segments) {
-                print(String(data: data, encoding: .utf8) ?? "[]")
+            switch transcribe(filePath: input, language: language) {
+            case .failure(let message):
+                fputs("Error: \(message)\n", stderr)
+                exit(1)
+            case .success(let segments):
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .prettyPrinted
+                if let data = try? encoder.encode(segments) {
+                    print(String(data: data, encoding: .utf8) ?? "[]")
+                }
+                exit(0)
             }
-            exit(0)
         default:
             fputs("Error: Speech recognition not authorized (status: \(status.rawValue))\n", stderr)
             exit(1)
         }
     }
-    RunLoop.main.run(until: Date(timeIntervalSinceNow: 300))
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 1800))
 }

@@ -4,6 +4,9 @@ import subprocess
 import json
 from pathlib import Path
 
+FFPROBE_TIMEOUT = 120
+FFMPEG_TIMEOUT = 3600
+
 
 def get_video_info(video_path: str) -> dict:
     cmd = [
@@ -13,24 +16,35 @@ def get_video_info(video_path: str) -> dict:
         "-show_entries", "format=duration",
         "-of", "json", video_path
     ]
-    output = subprocess.check_output(cmd).decode("utf-8")
+    output = subprocess.check_output(cmd, timeout=FFPROBE_TIMEOUT).decode("utf-8")
     info = json.loads(output)
 
-    stream = info["streams"][0]
+    streams = info.get("streams") or []
+    if not streams:
+        raise ValueError("No video stream found in %s" % video_path)
+
+    stream = streams[0]
     width = stream["width"]
     height = stream["height"]
     sar = stream.get("sample_aspect_ratio", "1:1")
     if sar and ":" in sar:
         sar_parts = sar.split(":")
-        sar_ratio = float(sar_parts[0]) / float(sar_parts[1])
+        try:
+            sar_ratio = float(sar_parts[0]) / float(sar_parts[1])
+        except (ValueError, ZeroDivisionError):
+            sar_ratio = 1.0
     else:
+        sar_ratio = 1.0
+    if sar_ratio <= 0:
         sar_ratio = 1.0
 
     display_width = int(width * sar_ratio)
 
-    duration = float(info.get("format", {}).get("duration", 0))
+    duration = float(info.get("format", {}).get("duration", 0) or 0)
     if not duration:
-        duration = float(stream.get("duration", 0))
+        duration = float(stream.get("duration", 0) or 0)
+    if not duration:
+        raise ValueError("Could not determine duration of %s" % video_path)
 
     return {
         "width": display_width,
@@ -51,7 +65,12 @@ def detect_scene_changes(video_path: str, threshold: float = 0.3) -> list[float]
         "-vsync", "vfr",
         "-f", "null", "-"
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg scene detection failed for %s (exit %d). stderr tail:\n%s"
+            % (video_path, result.returncode, result.stderr[-2000:])
+        )
 
     timestamps = []
     for line in result.stderr.split("\n"):

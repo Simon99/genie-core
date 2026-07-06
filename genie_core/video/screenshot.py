@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 from .detect import get_video_info, detect_scene_changes
+
+FFMPEG_TIMEOUT = 300
 
 
 def extract_screenshots(
@@ -25,6 +29,11 @@ def extract_screenshots(
     video_path = str(video_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear stale frames from previous runs so failures can't be masked
+    # by leftover files.
+    for stale in output_dir.glob("frame_*.png"):
+        stale.unlink()
 
     info = get_video_info(video_path)
     duration = info["duration"]
@@ -57,11 +66,26 @@ def extract_screenshots(
             str(out_file),
             "-y"
         ]
-        subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT)
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+            raise RuntimeError(
+                "ffmpeg frame extraction failed at t=%.2fs for %s (exit %d). stderr tail:\n%s"
+                % (t, video_path, result.returncode, stderr[-2000:])
+            )
         if out_file.exists():
             results.append({"time": t, "path": str(out_file)})
 
     return results
+
+
+def _escape_filter_path(path: str) -> str:
+    """Escape a filesystem path for use as a drawtext option value.
+
+    Backslashes, colons and single quotes are special in ffmpeg's filter
+    option syntax.
+    """
+    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
 def burn_subtitle(
@@ -75,6 +99,9 @@ def burn_subtitle(
 
     Supports multi-line subtitles (split by \\n). Each line gets its own
     drawtext filter stacked vertically from the bottom.
+
+    Text is passed via drawtext's textfile= option (a temp file per line),
+    which avoids all quote/%{} expansion issues of inline text=.
     """
     info = get_video_info(video_path)
     height = info["height"]
@@ -83,30 +110,42 @@ def burn_subtitle(
 
     lines = subtitle_text.split("\n")
 
-    # Stack lines from bottom: last line at 85% height, previous lines above
-    filters = []
-    for li, line in enumerate(lines):
-        escaped = line.replace("'", "\\'").replace(":", "\\:")
-        y_pos = int(height * 0.85) - (len(lines) - 1 - li) * line_height
-        filters.append(
-            "drawtext=fontfile=%s"
-            ":fontsize=%d"
-            ":fontcolor=yellow"
-            ":box=1:boxcolor=black@0.5:boxborderw=5"
-            ":x=(w-tw)/2:y=%d"
-            ":text='%s'" % (font_path, font_size, y_pos, escaped)
-        )
+    tmp_files = []
+    try:
+        # Stack lines from bottom: last line at 85% height, previous lines above
+        filters = []
+        for li, line in enumerate(lines):
+            fd, tmp_txt = tempfile.mkstemp(suffix=".txt")
+            tmp_files.append(tmp_txt)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(line)
 
-    vf = ",".join(filters)
+            y_pos = int(height * 0.85) - (len(lines) - 1 - li) * line_height
+            filters.append(
+                "drawtext=fontfile=%s"
+                ":fontsize=%d"
+                ":fontcolor=yellow"
+                ":box=1:boxcolor=black@0.5:boxborderw=5"
+                ":x=(w-tw)/2:y=%d"
+                ":textfile=%s" % (
+                    _escape_filter_path(font_path), font_size, y_pos,
+                    _escape_filter_path(tmp_txt),
+                )
+            )
 
-    cmd = [
-        "ffmpeg", "-ss", str(time),
-        "-i", video_path,
-        "-vf", vf,
-        "-vframes", "1",
-        "-q:v", "2",
-        output_file,
-        "-y"
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    return result.returncode == 0
+        vf = ",".join(filters)
+
+        cmd = [
+            "ffmpeg", "-ss", str(time),
+            "-i", video_path,
+            "-vf", vf,
+            "-vframes", "1",
+            "-q:v", "2",
+            output_file,
+            "-y"
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT)
+        return result.returncode == 0
+    finally:
+        for tmp_txt in tmp_files:
+            Path(tmp_txt).unlink(missing_ok=True)

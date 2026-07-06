@@ -8,19 +8,22 @@ import requests
 class LMStudioClient:
     """Client for LM Studio's OpenAI-compatible API (no openai SDK dependency)."""
 
-    def __init__(self, base_url: str = "http://localhost:1234/v1", model: str = None):
+    def __init__(self, base_url: str = "http://localhost:1234/v1", model: str = None,
+                 timeout=(5, 300)):
         self.base_url = base_url.rstrip("/")
         self._model = model
+        self.timeout = timeout
 
     @property
     def model(self) -> str:
         if self._model:
             return self._model
-        resp = requests.get(f"{self.base_url}/models")
+        resp = requests.get(f"{self.base_url}/models", timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json().get("data", [])
         if data:
-            return data[0]["id"]
+            self._model = data[0]["id"]
+            return self._model
         raise RuntimeError("No models loaded in LM Studio")
 
     def complete(self, prompt: str, system: str = None, temperature: float = 0.3) -> str:
@@ -32,6 +35,7 @@ class LMStudioClient:
         resp = requests.post(
             f"{self.base_url}/chat/completions",
             json={"model": self.model, "messages": messages, "temperature": temperature},
+            timeout=self.timeout,
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
@@ -59,6 +63,7 @@ class LMStudioClient:
         resp = requests.post(
             f"{self.base_url}/chat/completions",
             json={"model": self.model, "messages": messages, "temperature": temperature},
+            timeout=self.timeout,
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
