@@ -73,26 +73,36 @@ def burn_subtitle(
 ) -> bool:
     """Extract a frame at `time` with subtitle text burned in.
 
-    Uses ffmpeg drawtext filter (same approach as xdite/video2blog).
+    Supports multi-line subtitles (split by \\n). Each line gets its own
+    drawtext filter stacked vertically from the bottom.
     """
     info = get_video_info(video_path)
     height = info["height"]
     font_size = int(height / 20)
-    y_position = int(height * 0.85)
+    line_height = int(font_size * 1.4)
 
-    escaped_text = subtitle_text.replace("'", "\\'").replace(":", "\\:")
+    lines = subtitle_text.split("\n")
+
+    # Stack lines from bottom: last line at 85% height, previous lines above
+    filters = []
+    for li, line in enumerate(lines):
+        escaped = line.replace("'", "\\'").replace(":", "\\:")
+        y_pos = int(height * 0.85) - (len(lines) - 1 - li) * line_height
+        filters.append(
+            "drawtext=fontfile=%s"
+            ":fontsize=%d"
+            ":fontcolor=yellow"
+            ":box=1:boxcolor=black@0.5:boxborderw=5"
+            ":x=(w-tw)/2:y=%d"
+            ":text='%s'" % (font_path, font_size, y_pos, escaped)
+        )
+
+    vf = ",".join(filters)
 
     cmd = [
         "ffmpeg", "-ss", str(time),
         "-i", video_path,
-        "-vf", (
-            f"drawtext=fontfile={font_path}"
-            f":fontsize={font_size}"
-            f":fontcolor=yellow"
-            f":box=1:boxcolor=black@0.5:boxborderw=5"
-            f":x=(w-tw)/2:y={y_position}"
-            f":text='{escaped_text}'"
-        ),
+        "-vf", vf,
         "-vframes", "1",
         "-q:v", "2",
         output_file,
