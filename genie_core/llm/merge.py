@@ -124,6 +124,11 @@ def _merge_batch(batch: list, llm, merge_prompt: str, required_key: str = None):
             "merge_structured: LLM merge output was not valid JSON after retry: %s" % e
         )
     if not _ok(result):
+        if isinstance(result, list) and result:
+            logger.warning(
+                "merge output is a bare array after retry; coercing into %r",
+                required_key)
+            return {"title": "", required_key: result}
         if isinstance(result, dict) and result:
             # Salvage: the model answered with the inner shape (e.g. a bare
             # topic object) — wrap it instead of failing the whole run.
