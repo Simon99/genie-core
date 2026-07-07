@@ -92,13 +92,13 @@ def _merge_batch(batch: list, llm, merge_prompt: str):
         json.dumps(batch, ensure_ascii=False),
     )
 
-    response = llm.complete(prompt)
+    response = llm.complete(prompt, max_tokens=4096)
     try:
         return extract_json(response)
     except ValueError:
         pass
 
-    response = llm.complete(prompt, temperature=0)
+    response = llm.complete(prompt, temperature=0, max_tokens=4096)
     try:
         return extract_json(response)
     except ValueError as e:
