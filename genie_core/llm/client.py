@@ -76,7 +76,7 @@ class LMStudioClient:
     """
 
     def __init__(self, base_url: str = "http://localhost:1234/v1", model: str = None,
-                 timeout=(5, 300), kind: str = "text"):
+                 timeout=(5, 600), kind: str = "text"):
         self.base_url = base_url.rstrip("/")
         self._requested = model
         self._model = None

@@ -16,6 +16,7 @@ def merge_structured(
     merge_prompt: str,
     budget_tokens: int,
     estimate_tokens=None,
+    required_key: str = None,
 ) -> dict:
     """Hierarchically merge structured dicts with an LLM (tree merge).
 
@@ -34,6 +35,10 @@ def merge_structured(
 
     Each LLM response is parsed with extract_json; on parse failure the batch
     is retried once at temperature=0 before raising.
+    required_key: schema anchor (e.g. "topics") — a merge result that is
+    valid JSON but missing this key is retried with an explicit reminder,
+    then raises (models sometimes drop the outer report shape and return
+    a bare topic object).
     """
     if estimate_tokens is None:
         estimate_tokens = _default_estimate_tokens
@@ -58,7 +63,7 @@ def merge_structured(
             if len(batch) == 1:
                 merged.append(batch[0])
             else:
-                merged.append(_merge_batch(batch, llm, merge_prompt))
+                merged.append(_merge_batch(batch, llm, merge_prompt, required_key))
         current = merged
 
     return current[0]
@@ -85,23 +90,38 @@ def _make_batches(items: list, estimate_tokens, budget_tokens: int) -> list[list
     return batches
 
 
-def _merge_batch(batch: list, llm, merge_prompt: str):
-    """Merge one batch via the LLM; retry once at temperature=0 on bad JSON."""
+def _merge_batch(batch: list, llm, merge_prompt: str, required_key: str = None):
+    """Merge one batch via the LLM; retry once at temperature=0 on bad JSON
+    or on a schema-shape miss (required_key absent)."""
     prompt = "%s\n\n%s" % (
         merge_prompt,
         json.dumps(batch, ensure_ascii=False),
     )
 
+    def _ok(result):
+        return (isinstance(result, dict)
+                and (required_key is None or required_key in result))
+
     response = llm.complete(prompt, max_tokens=4096)
     try:
-        return extract_json(response)
+        result = extract_json(response)
+        if _ok(result):
+            return result
     except ValueError:
         pass
 
-    response = llm.complete(prompt, temperature=0, max_tokens=4096)
+    retry_prompt = prompt if required_key is None else (
+        prompt + "\n\nREMINDER: output MUST be a JSON object with a "
+                 "top-level \"%s\" array, exactly as specified." % required_key)
+    response = llm.complete(retry_prompt, temperature=0, max_tokens=4096)
     try:
-        return extract_json(response)
+        result = extract_json(response)
     except ValueError as e:
         raise ValueError(
             "merge_structured: LLM merge output was not valid JSON after retry: %s" % e
         )
+    if not _ok(result):
+        raise ValueError(
+            "merge_structured: merge output missing required key %r after retry"
+            % required_key)
+    return result
