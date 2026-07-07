@@ -26,21 +26,38 @@ class LMStudioClient:
             return self._model
         raise RuntimeError("No models loaded in LM Studio")
 
-    def complete(self, prompt: str, system: str = None, temperature: float = 0.3) -> str:
+    @staticmethod
+    def _extract_content(data: dict) -> str:
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or ""
+        if not content.strip() and (msg.get("reasoning_content") or "").strip():
+            # Thinking models stream reasoning into a separate channel; when
+            # the token budget runs out there, content comes back empty.
+            raise RuntimeError(
+                "LLM returned empty content but %d chars of reasoning — "
+                "a thinking model likely spent the whole token budget on "
+                "reasoning. Use a non-thinking model or raise max_tokens."
+                % len(msg["reasoning_content"]))
+        return content
+
+    def complete(self, prompt: str, system: str = None, temperature: float = 0.3,
+                 max_tokens: int = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        payload = {"model": self.model, "messages": messages, "temperature": temperature}
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
         resp = requests.post(
-            f"{self.base_url}/chat/completions",
-            json={"model": self.model, "messages": messages, "temperature": temperature},
-            timeout=self.timeout,
+            f"{self.base_url}/chat/completions", json=payload, timeout=self.timeout,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        return self._extract_content(resp.json())
 
-    def vision(self, prompt: str, image_path: str, system: str = None, temperature: float = 0.3) -> str:
+    def vision(self, prompt: str, image_path: str, system: str = None,
+               temperature: float = 0.3, max_tokens: int = None) -> str:
         """Send an image + text prompt to a vision model."""
         image_data = Path(image_path).read_bytes()
         b64 = base64.b64encode(image_data).decode("utf-8")
@@ -60,10 +77,11 @@ class LMStudioClient:
             ],
         })
 
+        payload = {"model": self.model, "messages": messages, "temperature": temperature}
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
         resp = requests.post(
-            f"{self.base_url}/chat/completions",
-            json={"model": self.model, "messages": messages, "temperature": temperature},
-            timeout=self.timeout,
+            f"{self.base_url}/chat/completions", json=payload, timeout=self.timeout,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        return self._extract_content(resp.json())
