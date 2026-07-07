@@ -75,6 +75,7 @@ def transcribe_audio(
     model: str = "medium",
     output_srt: str | None = None,
     backend: str = "auto",
+    initial_prompt: str | None = None,
 ) -> list[dict]:
     """Transcribe audio/video to timestamped segments.
 
@@ -82,6 +83,9 @@ def transcribe_audio(
              "mlx" (mlx-whisper, Apple Silicon GPU),
              "openai" (openai-whisper CLI),
              "apple" (macOS Speech Framework via local proxy)
+
+    initial_prompt: optional hotword/context string that biases whisper
+    decoding toward domain terms (ignored by the apple backend).
 
     Returns list of {"start": float, "end": float, "text": str}.
     """
@@ -96,11 +100,11 @@ def transcribe_audio(
         backend = _detect_backend()
 
     if backend == "mlx":
-        return _transcribe_mlx(input_path, language, model, output_srt)
+        return _transcribe_mlx(input_path, language, model, output_srt, initial_prompt)
     elif backend == "apple":
         return _transcribe_apple(input_path, language, output_srt)
     else:
-        return _transcribe_openai(input_path, language, model, output_srt)
+        return _transcribe_openai(input_path, language, model, output_srt, initial_prompt)
 
 
 def _detect_backend() -> str:
@@ -122,7 +126,8 @@ def _detect_backend() -> str:
     return "openai"
 
 
-def _transcribe_mlx(input_path: str, language: str, model: str, output_srt: str = None) -> list[dict]:
+def _transcribe_mlx(input_path: str, language: str, model: str,
+                    output_srt: str = None, initial_prompt: str = None) -> list[dict]:
     """Transcribe using mlx-whisper (Apple Silicon GPU accelerated)."""
     import mlx_whisper
 
@@ -137,14 +142,23 @@ def _transcribe_mlx(input_path: str, language: str, model: str, output_srt: str 
 
     try:
         model_name = "mlx-community/whisper-%s-mlx" % model
-        result = mlx_whisper.transcribe(
-            audio_path,
-            path_or_hf_repo=model_name,
-            language=language,
-        )
+        kwargs = {"path_or_hf_repo": model_name, "language": language}
+        if initial_prompt:
+            kwargs["initial_prompt"] = initial_prompt
+        result = mlx_whisper.transcribe(audio_path, **kwargs)
 
         segments = []
         for seg in result.get("segments", []):
+            # Anti-hallucination filter (openai-whisper conventions).
+            # Quiet/noise chunks — especially through meeting-codec AGC —
+            # produce fluent looping text; such segments carry high
+            # no_speech_prob (+ low avg_logprob) or an extreme
+            # compression_ratio from the repetition.
+            if (seg.get("no_speech_prob", 0.0) > 0.6
+                    and seg.get("avg_logprob", 0.0) < -1.0):
+                continue
+            if seg.get("compression_ratio", 0.0) > 2.4:
+                continue
             segments.append({
                 "start": seg["start"],
                 "end": seg["end"],
@@ -160,7 +174,8 @@ def _transcribe_mlx(input_path: str, language: str, model: str, output_srt: str 
             Path(tmp_wav).unlink(missing_ok=True)
 
 
-def _transcribe_openai(input_path: str, language: str, model: str, output_srt: str = None) -> list[dict]:
+def _transcribe_openai(input_path: str, language: str, model: str,
+                       output_srt: str = None, initial_prompt: str = None) -> list[dict]:
     """Transcribe using openai-whisper CLI."""
     with tempfile.TemporaryDirectory() as tmpdir:
         audio_path = input_path
@@ -175,6 +190,8 @@ def _transcribe_openai(input_path: str, language: str, model: str, output_srt: s
             "--output_format", "json",
             "--output_dir", tmpdir,
         ]
+        if initial_prompt:
+            cmd.extend(["--initial_prompt", initial_prompt])
         _run_subprocess(cmd, timeout=WHISPER_TIMEOUT,
                         install_hint="pip install openai-whisper")
 
