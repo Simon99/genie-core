@@ -105,13 +105,7 @@ class LMStudioClient:
                 % len(msg["reasoning_content"]))
         return content
 
-    def complete(self, prompt: str, system: str = None, temperature: float = 0.3,
-                 max_tokens: int = None) -> str:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
+    def _post_chat(self, messages: list, temperature: float, max_tokens: int) -> str:
         payload = {"model": self.model, "messages": messages, "temperature": temperature}
         if max_tokens:
             payload["max_tokens"] = max_tokens
@@ -120,6 +114,26 @@ class LMStudioClient:
         )
         resp.raise_for_status()
         return self._extract_content(resp.json())
+
+    def complete(self, prompt: str, system: str = None, temperature: float = 0.3,
+                 max_tokens: int = None) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            return self._post_chat(messages, temperature, max_tokens)
+        except RuntimeError:
+            if not max_tokens:
+                raise
+            # Reasoning ate the whole budget; give it one doubled retry
+            # (observed: glm-4.7-flash spent 11k chars thinking about a
+            # merge prompt and returned empty content at max_tokens=4096).
+            bigger = max(max_tokens * 2, 8192)
+            logger.warning("empty content at max_tokens=%d, retrying with %d",
+                           max_tokens, bigger)
+            return self._post_chat(messages, temperature, bigger)
 
     def vision(self, prompt: str, image_path: str, system: str = None,
                temperature: float = 0.3, max_tokens: int = None) -> str:
