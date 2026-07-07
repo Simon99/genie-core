@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from .parse import extract_json
+
+logger = logging.getLogger(__name__)
 
 
 def _default_estimate_tokens(item) -> int:
@@ -121,6 +124,13 @@ def _merge_batch(batch: list, llm, merge_prompt: str, required_key: str = None):
             "merge_structured: LLM merge output was not valid JSON after retry: %s" % e
         )
     if not _ok(result):
+        if isinstance(result, dict) and result:
+            # Salvage: the model answered with the inner shape (e.g. a bare
+            # topic object) — wrap it instead of failing the whole run.
+            logger.warning(
+                "merge output missing %r after retry; coercing %s into a wrapper",
+                required_key, list(result)[:5])
+            return {"title": result.get("title", ""), required_key: [result]}
         raise ValueError(
             "merge_structured: merge output missing required key %r after retry"
             % required_key)
