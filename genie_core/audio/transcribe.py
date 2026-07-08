@@ -53,7 +53,16 @@ WHISPER_TO_BCP47 = {
 WHISPER_TIMEOUT = 3600
 FFMPEG_TIMEOUT = 600
 
-VALID_BACKENDS = ("auto", "mlx", "openai", "apple")
+VALID_BACKENDS = ("auto", "mlx", "openai", "apple", "groq")
+
+# Groq cloud whisper (whisper-large-v3). Free tier: 25 MB per request,
+# so audio is re-encoded to 64 kbps mono mp3 and split when still too big.
+GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MODEL = "whisper-large-v3"
+GROQ_MAX_BYTES = 24 * 1024 * 1024
+GROQ_CHUNK_SECONDS = 1500          # ~25 min at 64 kbps ≈ 12 MB
+GROQ_TIMEOUT = 900
+ENV_FILE = Path.home() / ".env"
 
 
 def _is_audio_file(path: str) -> bool:
@@ -82,7 +91,9 @@ def transcribe_audio(
     backend: "auto" (try mlx-whisper → openai-whisper),
              "mlx" (mlx-whisper, Apple Silicon GPU),
              "openai" (openai-whisper CLI),
-             "apple" (macOS Speech Framework via local proxy)
+             "apple" (macOS Speech Framework via local proxy),
+             "groq" (cloud whisper-large-v3; needs GROQ_API_KEY,
+                     audio leaves the machine)
 
     initial_prompt: optional hotword/context string that biases whisper
     decoding toward domain terms (ignored by the apple backend).
@@ -103,6 +114,8 @@ def transcribe_audio(
         return _transcribe_mlx(input_path, language, model, output_srt, initial_prompt)
     elif backend == "apple":
         return _transcribe_apple(input_path, language, output_srt)
+    elif backend == "groq":
+        return _transcribe_groq(input_path, language, output_srt, initial_prompt)
     else:
         return _transcribe_openai(input_path, language, model, output_srt, initial_prompt)
 
@@ -147,23 +160,7 @@ def _transcribe_mlx(input_path: str, language: str, model: str,
             kwargs["initial_prompt"] = initial_prompt
         result = mlx_whisper.transcribe(audio_path, **kwargs)
 
-        segments = []
-        for seg in result.get("segments", []):
-            # Anti-hallucination filter (openai-whisper conventions).
-            # Quiet/noise chunks — especially through meeting-codec AGC —
-            # produce fluent looping text; such segments carry high
-            # no_speech_prob (+ low avg_logprob) or an extreme
-            # compression_ratio from the repetition.
-            if (seg.get("no_speech_prob", 0.0) > 0.6
-                    and seg.get("avg_logprob", 0.0) < -1.0):
-                continue
-            if seg.get("compression_ratio", 0.0) > 2.4:
-                continue
-            segments.append({
-                "start": seg["start"],
-                "end": seg["end"],
-                "text": seg["text"].strip(),
-            })
+        segments = _filter_segments(result.get("segments", []))
 
         if output_srt:
             _write_srt(segments, output_srt)
@@ -247,6 +244,151 @@ def _transcribe_apple(input_path: str, language: str, output_srt: str = None) ->
     finally:
         if tmp_wav:
             Path(tmp_wav).unlink(missing_ok=True)
+
+
+def _filter_segments(raw: list, offset: float = 0.0) -> list[dict]:
+    """Drop hallucinated segments (openai-whisper conventions).
+
+    Quiet/noise chunks — especially through meeting-codec AGC — produce
+    fluent looping text; such segments carry a high no_speech_prob (with
+    low avg_logprob) or an extreme compression_ratio from the repetition.
+    """
+    segments = []
+    for seg in raw:
+        if (seg.get("no_speech_prob", 0.0) > 0.6
+                and seg.get("avg_logprob", 0.0) < -1.0):
+            continue
+        if seg.get("compression_ratio", 0.0) > 2.4:
+            continue
+        segments.append({
+            "start": seg["start"] + offset,
+            "end": seg["end"] + offset,
+            "text": seg["text"].strip(),
+        })
+    return segments
+
+
+def read_env_value(key: str, env_file=None) -> str | None:
+    """Read KEY=value from a dotenv-style file (default ~/.env)."""
+    path = Path(env_file or ENV_FILE)
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def write_env_value(key: str, value: str, env_file=None):
+    """Set KEY=value in a dotenv-style file, replacing any existing line."""
+    path = Path(env_file or ENV_FILE)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    out, replaced = [], False
+    for line in lines:
+        if line.strip().startswith(key + "="):
+            out.append("%s=%s" % (key, value))
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append("%s=%s" % (key, value))
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def groq_api_key() -> str:
+    key = os.environ.get("GROQ_API_KEY") or read_env_value("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "GROQ_API_KEY not set (env var or ~/.env). Get one at "
+            "https://console.groq.com/keys")
+    return key
+
+
+def verify_groq_key(key: str) -> tuple:
+    """(ok, message) — cheap authenticated call against the models endpoint."""
+    import requests
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": "Bearer " + key}, timeout=15)
+    except Exception as e:
+        return False, "無法連線 Groq:%s" % e
+    if r.status_code == 200:
+        return True, "金鑰有效"
+    if r.status_code in (401, 403):
+        return False, "金鑰無效或權限不足(HTTP %d)" % r.status_code
+    return False, "Groq 回應 HTTP %d" % r.status_code
+
+
+def _encode_for_groq(input_path: str, out_path: str):
+    """64 kbps mono mp3 — 25 min ≈ 12 MB, well under the 25 MB request cap."""
+    cmd = ["ffmpeg", "-i", input_path, "-vn", "-ar", "16000", "-ac", "1",
+           "-b:a", "64k", out_path, "-y"]
+    _run_subprocess(cmd, timeout=FFMPEG_TIMEOUT,
+                    install_hint="brew install ffmpeg (or apt install ffmpeg)")
+
+
+def _split_audio(src: str, out_dir: str, seconds: int) -> list[str]:
+    pattern = str(Path(out_dir) / "part_%03d.mp3")
+    cmd = ["ffmpeg", "-i", src, "-f", "segment", "-segment_time", str(seconds),
+           "-c", "copy", pattern, "-y"]
+    _run_subprocess(cmd, timeout=FFMPEG_TIMEOUT,
+                    install_hint="brew install ffmpeg (or apt install ffmpeg)")
+    return sorted(str(p) for p in Path(out_dir).glob("part_*.mp3"))
+
+
+def _groq_one(audio_path: str, language: str, prompt: str, key: str) -> dict:
+    import requests
+    with open(audio_path, "rb") as fh:
+        data = {"model": GROQ_MODEL, "response_format": "verbose_json"}
+        if language:
+            data["language"] = language
+        if prompt:
+            data["prompt"] = prompt[:1000]   # Groq caps the prompt at ~224 tokens
+        r = requests.post(GROQ_URL, headers={"Authorization": "Bearer " + key},
+                          files={"file": fh}, data=data, timeout=GROQ_TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError("Groq transcription failed (HTTP %d): %s"
+                           % (r.status_code, r.text[:300]))
+    return r.json()
+
+
+def _transcribe_groq(input_path: str, language: str, output_srt: str = None,
+                     initial_prompt: str = None) -> list[dict]:
+    """Cloud transcription via Groq whisper-large-v3.
+
+    More accurate than local medium on noisy audio and ~50x realtime, but
+    the audio leaves the machine — pick the backend accordingly.
+    """
+    key = groq_api_key()
+    # Traditional-Chinese hint: Groq's zh output otherwise skews Simplified.
+    prompt = initial_prompt or ""
+    if language == "zh" and "繁體" not in prompt:
+        prompt = ("以下是繁體中文的會議或課程逐字稿。" + prompt).strip()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mp3 = str(Path(tmpdir) / "audio.mp3")
+        _encode_for_groq(input_path, mp3)
+
+        parts = [mp3]
+        if Path(mp3).stat().st_size > GROQ_MAX_BYTES:
+            parts = _split_audio(mp3, tmpdir, GROQ_CHUNK_SECONDS)
+            if not parts:
+                raise RuntimeError("Groq: failed to split oversized audio")
+
+        segments, offset = [], 0.0
+        for part in parts:
+            data = _groq_one(part, language, prompt, key)
+            segments.extend(_filter_segments(data.get("segments", []), offset))
+            offset += float(data.get("duration") or 0.0)
+
+    if output_srt:
+        _write_srt(segments, output_srt)
+    return segments
 
 
 def _run_subprocess(cmd: list[str], timeout: int, install_hint: str = None):
