@@ -68,8 +68,11 @@ GROQ_CHUNK_SECONDS = 1500          # ~25 min at 64 kbps ≈ 12 MB
 GROQ_TIMEOUT = 900
 ENV_FILE = Path.home() / ".env"
 
-# Free-tier daily caps (audio-seconds / requests), used for the local ledger.
-GROQ_DAILY_AUDIO_SECONDS = 28800
+# Groq documents a free-tier daily audio cap (28800 s), but it is not
+# returned in any header and — measured on 2026-07-08 — is not enforced
+# for this account (40k+ audio-seconds served without a 429). Treat it as
+# a reference number only; the authoritative signal is a 429 response.
+GROQ_DOC_DAILY_AUDIO_SECONDS = 28800
 GROQ_USAGE_FILE = Path.home() / ".genie" / "groq_usage.json"
 
 
@@ -462,22 +465,22 @@ def groq_usage_today() -> dict:
     - requests_*   : reported by Groq on the last response (authoritative,
                      as of ``updated_at``); None until the first call.
     - audio_seconds: local tally of what this machine sent today; other
-                     machines sharing the key are invisible to it.
+                     machines sharing the key are invisible to it. No
+                     remaining-audio figure is derived from it — the
+                     documented daily cap is not enforced in practice
+                     (see GROQ_DOC_DAILY_AUDIO_SECONDS).
     """
     today = time.strftime("%Y-%m-%d")
     data = _read_usage_file()
     fresh = data.get("date") == today
     used = float(data.get("audio_seconds", 0)) if fresh else 0.0
     return {
-        "audio_seconds": round(used),                       # local estimate
-        "limit_seconds": GROQ_DAILY_AUDIO_SECONDS,
-        "remaining_seconds": max(GROQ_DAILY_AUDIO_SECONDS - round(used), 0),
+        "audio_seconds": round(used),                           # local tally
+        "doc_daily_audio_seconds": GROQ_DOC_DAILY_AUDIO_SECONDS,  # reference only
         "requests_remaining": data.get("requests_remaining"),   # from Groq
         "requests_limit": data.get("requests_limit"),
         "requests_reset": data.get("requests_reset"),
         "updated_at": data.get("updated_at"),
-        "source": "groq-headers" if data.get("requests_remaining") is not None
-                  else "local-estimate",
     }
 
 

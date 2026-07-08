@@ -91,7 +91,10 @@ rate-limit header**(`x-ratelimit-{limit,remaining,reset}-requests`,實測確認)
 沒有 audio-seconds header,也沒有用量查詢 API,因此:
 
 - `requests_remaining` / `requests_limit`:**Groq 回報的權威值**(上次請求時的快照)
-- `audio_seconds`:本機累計的估計值(其他機器共用同一金鑰時看不到)
+- `audio_seconds`:本機累計的已送音訊秒數(其他機器共用同一金鑰時看不到)
+
+文件宣稱免費層每日 28800 音訊秒上限,但**實測不強制**(2026-07-08 單日送出
+40k+ 秒仍正常服務),因此不從中推算「剩餘額度」;真正的權威訊號是 429 回應。
 
 輔助函式:`verify_groq_key(key)`(即時驗證)、`read_env_value` / `write_env_value`
 (管理 `~/.env`,寫入時 chmod 600)。
