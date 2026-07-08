@@ -419,7 +419,9 @@ def _groq_one(audio_path: str, language: str, prompt: str, key: str,
             raise GroqUnavailable("Groq unreachable: %s" % e)
 
         if r.status_code == 200:
-            return r.json()
+            body = r.json()
+            body["_headers"] = dict(r.headers)
+            return body
 
         if r.status_code == 429:
             if _groq_daily_quota_hit(r):
@@ -443,34 +445,59 @@ def _groq_one(audio_path: str, language: str, prompt: str, key: str,
     raise GroqUnavailable("Groq: retries exhausted")
 
 
-def groq_usage_today() -> dict:
-    """{"audio_seconds", "requests", "limit_seconds", "remaining_seconds"}.
+def _read_usage_file() -> dict:
+    try:
+        return json.loads(GROQ_USAGE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
-    A local ledger — Groq exposes no usage endpoint, so this only counts
-    what this machine sent, and resets at local midnight.
+
+def groq_usage_today() -> dict:
+    """Current Groq budget, mixing authoritative and estimated numbers.
+
+    Groq's whisper responses carry only request-count rate-limit headers
+    (x-ratelimit-{limit,remaining,reset}-requests) — verified against the
+    live API; there is no audio-seconds header and no usage endpoint. So:
+
+    - requests_*   : reported by Groq on the last response (authoritative,
+                     as of ``updated_at``); None until the first call.
+    - audio_seconds: local tally of what this machine sent today; other
+                     machines sharing the key are invisible to it.
     """
     today = time.strftime("%Y-%m-%d")
-    used, reqs = 0.0, 0
-    try:
-        data = json.loads(GROQ_USAGE_FILE.read_text(encoding="utf-8"))
-        if data.get("date") == today:
-            used, reqs = float(data.get("audio_seconds", 0)), int(data.get("requests", 0))
-    except Exception:
-        pass
-    return {"audio_seconds": round(used), "requests": reqs,
-            "limit_seconds": GROQ_DAILY_AUDIO_SECONDS,
-            "remaining_seconds": max(GROQ_DAILY_AUDIO_SECONDS - round(used), 0)}
+    data = _read_usage_file()
+    fresh = data.get("date") == today
+    used = float(data.get("audio_seconds", 0)) if fresh else 0.0
+    return {
+        "audio_seconds": round(used),                       # local estimate
+        "limit_seconds": GROQ_DAILY_AUDIO_SECONDS,
+        "remaining_seconds": max(GROQ_DAILY_AUDIO_SECONDS - round(used), 0),
+        "requests_remaining": data.get("requests_remaining"),   # from Groq
+        "requests_limit": data.get("requests_limit"),
+        "requests_reset": data.get("requests_reset"),
+        "updated_at": data.get("updated_at"),
+        "source": "groq-headers" if data.get("requests_remaining") is not None
+                  else "local-estimate",
+    }
 
 
-def _record_groq_usage(audio_seconds: float):
+def _record_groq_usage(audio_seconds: float, headers=None):
+    """Append to the local audio tally; overwrite request counters from Groq."""
     try:
-        cur = groq_usage_today()
+        today = time.strftime("%Y-%m-%d")
+        data = _read_usage_file()
+        if data.get("date") != today:
+            data = {"date": today, "audio_seconds": 0.0}
+        data["audio_seconds"] = float(data.get("audio_seconds", 0)) + audio_seconds
+        h = headers or {}
+        remaining = h.get("x-ratelimit-remaining-requests")
+        if remaining is not None:
+            data["requests_remaining"] = int(remaining)
+            data["requests_limit"] = int(h.get("x-ratelimit-limit-requests") or 0) or None
+            data["requests_reset"] = h.get("x-ratelimit-reset-requests")
+            data["updated_at"] = time.strftime("%H:%M:%S")
         GROQ_USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        GROQ_USAGE_FILE.write_text(json.dumps({
-            "date": time.strftime("%Y-%m-%d"),
-            "audio_seconds": cur["audio_seconds"] + audio_seconds,
-            "requests": cur["requests"] + 1,
-        }), encoding="utf-8")
+        GROQ_USAGE_FILE.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         logger.exception("failed to update Groq usage ledger")
 
@@ -502,7 +529,7 @@ def _transcribe_groq(input_path: str, language: str, output_srt: str = None,
         for part in parts:
             data = _groq_one(part, language, prompt, key)
             part_seconds = float(data.get("duration") or 0.0)
-            _record_groq_usage(part_seconds)
+            _record_groq_usage(part_seconds, data.pop("_headers", None))
             segments.extend(_filter_segments(data.get("segments", []), offset))
             offset += part_seconds
 

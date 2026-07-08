@@ -85,8 +85,13 @@ mono mp3(25 MB 上限)、超長切 25 分鐘段並校正時間戳、繁中 promp
 | 401 金鑰無效、4xx 輸入錯誤 | **直接報錯**(fallback 只會掩蓋問題) |
 
 `groq_fallback=False` 時上述可恢復錯誤改為拋出 `GroqUnavailable`。
-`groq_usage_today()` 回傳本機當日已用音訊秒數(免費層 28800 秒/日);
-這是本地帳本,Groq 並無用量查詢 API。
+
+`groq_usage_today()` 回傳當日額度狀況。**Groq 對 whisper 只回請求數的
+rate-limit header**(`x-ratelimit-{limit,remaining,reset}-requests`,實測確認),
+沒有 audio-seconds header,也沒有用量查詢 API,因此:
+
+- `requests_remaining` / `requests_limit`:**Groq 回報的權威值**(上次請求時的快照)
+- `audio_seconds`:本機累計的估計值(其他機器共用同一金鑰時看不到)
 
 輔助函式:`verify_groq_key(key)`(即時驗證)、`read_env_value` / `write_env_value`
 (管理 `~/.env`,寫入時 chmod 600)。
