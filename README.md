@@ -59,10 +59,37 @@ segs = transcribe_audio("rec.mp4", backend="mlx", model="medium", language="zh",
 # → [{"start": 0.0, "end": 2.5, "text": "..."}]
 ```
 
-- `backend`:`auto`(mlx→openai)/ `mlx` / `openai` / `apple`(需 proxy,見下)
+- `backend`:`auto`(mlx→openai)/ `mlx` / `openai` / `apple`(需 proxy,見下)/ `groq`(雲端)
 - `language` 用 whisper 碼(`zh`/`en`);apple 後端內部自動轉 BCP-47(`zh-Hans`)
 - **反幻聽**:靜音/雜訊產生的段落(`no_speech_prob` 高、`compression_ratio > 2.4` 的迴圈)自動過濾
 - mlx 模型已快取後,設 `HF_HUB_OFFLINE=1` 可跳過每次轉寫的 HuggingFace 網路檢查(省數百 ms + log 噪音)
+
+### Groq 雲端後端
+
+```python
+segs = transcribe_audio("rec.mp4", backend="groq", language="zh")   # 需 GROQ_API_KEY
+```
+
+`GROQ_API_KEY` 取自環境變數或 `~/.env`。實測 whisper-large-v3 約 100× 實時,
+嘈雜音源明顯比本地 medium 準;音訊會上傳,自行斟酌。實作細節:自動轉 64 kbps
+mono mp3(25 MB 上限)、超長切 25 分鐘段並校正時間戳、繁中 prompt 偏置、
+與本地路徑共用同一套幻聽過濾。
+
+**失敗處理**(`groq_fallback=True`,預設):
+
+| 情境 | 行為 |
+|---|---|
+| 每分鐘限流 429 | 依 `retry-after` 等待重試一次;成功就繼續用 Groq |
+| 每日額度用盡 429 | 不重試,**自動改用本地後端**完成該次轉寫 |
+| 5xx / 網路錯誤 | 重試一次,仍失敗則自動改用本地 |
+| 401 金鑰無效、4xx 輸入錯誤 | **直接報錯**(fallback 只會掩蓋問題) |
+
+`groq_fallback=False` 時上述可恢復錯誤改為拋出 `GroqUnavailable`。
+`groq_usage_today()` 回傳本機當日已用音訊秒數(免費層 28800 秒/日);
+這是本地帳本,Groq 並無用量查詢 API。
+
+輔助函式:`verify_groq_key(key)`(即時驗證)、`read_env_value` / `write_env_value`
+(管理 `~/.env`,寫入時 chmod 600)。
 
 ## Apple Speech proxy(swift-cli/)
 

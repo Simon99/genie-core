@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import json
 import tempfile
+import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Audio file extensions that can be fed to the backends directly
 # (anything else is first extracted to wav via ffmpeg).
@@ -64,6 +68,10 @@ GROQ_CHUNK_SECONDS = 1500          # ~25 min at 64 kbps ≈ 12 MB
 GROQ_TIMEOUT = 900
 ENV_FILE = Path.home() / ".env"
 
+# Free-tier daily caps (audio-seconds / requests), used for the local ledger.
+GROQ_DAILY_AUDIO_SECONDS = 28800
+GROQ_USAGE_FILE = Path.home() / ".genie" / "groq_usage.json"
+
 
 def _is_audio_file(path: str) -> bool:
     return Path(path).suffix.lower() in AUDIO_EXTENSIONS
@@ -85,6 +93,7 @@ def transcribe_audio(
     output_srt: str | None = None,
     backend: str = "auto",
     initial_prompt: str | None = None,
+    groq_fallback: bool = True,
 ) -> list[dict]:
     """Transcribe audio/video to timestamped segments.
 
@@ -97,6 +106,11 @@ def transcribe_audio(
 
     initial_prompt: optional hotword/context string that biases whisper
     decoding toward domain terms (ignored by the apple backend).
+
+    groq_fallback: when the groq backend hits rate limits, quota, server
+    errors or network failures, transparently redo the transcription with
+    the local backend (cloud -> local is the privacy-safe direction).
+    Auth/input errors always raise: a fallback would only hide them.
 
     Returns list of {"start": float, "end": float, "text": str}.
     """
@@ -115,7 +129,16 @@ def transcribe_audio(
     elif backend == "apple":
         return _transcribe_apple(input_path, language, output_srt)
     elif backend == "groq":
-        return _transcribe_groq(input_path, language, output_srt, initial_prompt)
+        try:
+            return _transcribe_groq(input_path, language, output_srt, initial_prompt)
+        except GroqUnavailable as e:
+            if not groq_fallback:
+                raise
+            logger.warning("Groq unavailable (%s) — falling back to local %s",
+                           e, _detect_backend())
+            return transcribe_audio(input_path, language=language, model=model,
+                                    output_srt=output_srt, backend="auto",
+                                    initial_prompt=initial_prompt)
     else:
         return _transcribe_openai(input_path, language, model, output_srt, initial_prompt)
 
@@ -341,20 +364,115 @@ def _split_audio(src: str, out_dir: str, seconds: int) -> list[str]:
     return sorted(str(p) for p in Path(out_dir).glob("part_*.mp3"))
 
 
-def _groq_one(audio_path: str, language: str, prompt: str, key: str) -> dict:
+class GroqUnavailable(RuntimeError):
+    """Groq could not serve the request, but the request itself is fine.
+
+    Rate limits, quota exhaustion, server errors, network failures — the
+    caller may retry later or fall back to a local backend. Contrast with
+    plain RuntimeError for auth/input errors, which a fallback would only
+    paper over.
+    """
+
+
+def _groq_retry_after(resp) -> float:
+    try:
+        return min(float(resp.headers.get("retry-after", "")), 120.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _groq_daily_quota_hit(resp) -> bool:
+    """Distinguish per-minute throttling from the daily audio-seconds cap."""
+    body = (resp.text or "").lower()
+    if "audio_seconds per day" in body or "audio-seconds per day" in body:
+        return True
+    if "requests per day" in body or "rpd" in body:
+        return True
+    # A retry-after beyond a few minutes can only be a daily window.
+    try:
+        return float(resp.headers.get("retry-after", "0")) > 300
+    except ValueError:
+        return False
+
+
+def _groq_one(audio_path: str, language: str, prompt: str, key: str,
+              retries: int = 1) -> dict:
     import requests
-    with open(audio_path, "rb") as fh:
-        data = {"model": GROQ_MODEL, "response_format": "verbose_json"}
-        if language:
-            data["language"] = language
-        if prompt:
-            data["prompt"] = prompt[:1000]   # Groq caps the prompt at ~224 tokens
-        r = requests.post(GROQ_URL, headers={"Authorization": "Bearer " + key},
-                          files={"file": fh}, data=data, timeout=GROQ_TIMEOUT)
-    if r.status_code != 200:
+
+    def post():
+        with open(audio_path, "rb") as fh:
+            data = {"model": GROQ_MODEL, "response_format": "verbose_json"}
+            if language:
+                data["language"] = language
+            if prompt:
+                data["prompt"] = prompt[:1000]   # Groq caps the prompt at ~224 tokens
+            return requests.post(GROQ_URL, headers={"Authorization": "Bearer " + key},
+                                 files={"file": fh}, data=data, timeout=GROQ_TIMEOUT)
+
+    for attempt in range(retries + 1):
+        try:
+            r = post()
+        except Exception as e:                       # network / DNS / timeout
+            if attempt < retries:
+                time.sleep(5)
+                continue
+            raise GroqUnavailable("Groq unreachable: %s" % e)
+
+        if r.status_code == 200:
+            return r.json()
+
+        if r.status_code == 429:
+            if _groq_daily_quota_hit(r):
+                raise GroqUnavailable("Groq daily quota exhausted: %s" % r.text[:200])
+            if attempt < retries:
+                time.sleep(_groq_retry_after(r) or 60.0)
+                continue
+            raise GroqUnavailable("Groq rate limited: %s" % r.text[:200])
+
+        if r.status_code >= 500:
+            if attempt < retries:
+                time.sleep(_groq_retry_after(r) or 10.0)
+                continue
+            raise GroqUnavailable("Groq server error (HTTP %d): %s"
+                                  % (r.status_code, r.text[:200]))
+
+        # 4xx other than 429: bad key, bad file, unsupported params — a
+        # local fallback would only hide the real problem.
         raise RuntimeError("Groq transcription failed (HTTP %d): %s"
                            % (r.status_code, r.text[:300]))
-    return r.json()
+    raise GroqUnavailable("Groq: retries exhausted")
+
+
+def groq_usage_today() -> dict:
+    """{"audio_seconds", "requests", "limit_seconds", "remaining_seconds"}.
+
+    A local ledger — Groq exposes no usage endpoint, so this only counts
+    what this machine sent, and resets at local midnight.
+    """
+    today = time.strftime("%Y-%m-%d")
+    used, reqs = 0.0, 0
+    try:
+        data = json.loads(GROQ_USAGE_FILE.read_text(encoding="utf-8"))
+        if data.get("date") == today:
+            used, reqs = float(data.get("audio_seconds", 0)), int(data.get("requests", 0))
+    except Exception:
+        pass
+    return {"audio_seconds": round(used), "requests": reqs,
+            "limit_seconds": GROQ_DAILY_AUDIO_SECONDS,
+            "remaining_seconds": max(GROQ_DAILY_AUDIO_SECONDS - round(used), 0)}
+
+
+def _record_groq_usage(audio_seconds: float):
+    try:
+        cur = groq_usage_today()
+        GROQ_USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GROQ_USAGE_FILE.write_text(json.dumps({
+            "date": time.strftime("%Y-%m-%d"),
+            "audio_seconds": cur["audio_seconds"] + audio_seconds,
+            "requests": cur["requests"] + 1,
+        }), encoding="utf-8")
+    except Exception:
+        logger.exception("failed to update Groq usage ledger")
 
 
 def _transcribe_groq(input_path: str, language: str, output_srt: str = None,
@@ -383,8 +501,10 @@ def _transcribe_groq(input_path: str, language: str, output_srt: str = None,
         segments, offset = [], 0.0
         for part in parts:
             data = _groq_one(part, language, prompt, key)
+            part_seconds = float(data.get("duration") or 0.0)
+            _record_groq_usage(part_seconds)
             segments.extend(_filter_segments(data.get("segments", []), offset))
-            offset += float(data.get("duration") or 0.0)
+            offset += part_seconds
 
     if output_srt:
         _write_srt(segments, output_srt)
